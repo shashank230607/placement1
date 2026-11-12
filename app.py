@@ -8,6 +8,8 @@ from datetime import date
 import pandas as pd
 import streamlit as st
 
+from init_db import initialize_database
+
 
 # Keep the database next to this Python file so the app finds it from any folder.
 DATABASE_PATH = Path(__file__).with_name("placements.db")
@@ -28,7 +30,8 @@ def get_applications():
         connection.row_factory = sqlite3.Row
         applications = connection.execute(
             """
-            SELECT application_id, company_name, job_role, application_date, status
+            SELECT application_id, company_name, job_role, application_date, status,
+                   interview_date
             FROM applications
             ORDER BY application_date DESC, application_id DESC
             """
@@ -54,17 +57,76 @@ def get_applications():
     return applications, role_counts, status_rows
 
 
-def add_application(company_name, job_role, application_date, status):
+def get_upcoming_interviews(today=None):
+    """Return scheduled applications with an interview date today or later."""
+    today = today or date.today()
+    with closing(sqlite3.connect(DATABASE_PATH)) as connection:
+        connection.row_factory = sqlite3.Row
+        return connection.execute(
+            """
+            SELECT application_id, company_name, job_role, interview_date, status
+            FROM applications
+            WHERE status = ? AND interview_date >= ?
+            ORDER BY interview_date ASC, company_name COLLATE NOCASE ASC
+            """,
+            ("Interview Scheduled", today.isoformat()),
+        ).fetchall()
+
+
+def add_application(company_name, job_role, application_date, status, interview_date):
     """Save one application using placeholders to safely pass user input."""
     with closing(sqlite3.connect(DATABASE_PATH)) as connection:
         with connection:
             connection.execute(
                 """
-                INSERT INTO applications (company_name, job_role, application_date, status)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO applications (
+                    company_name, job_role, application_date, status, interview_date
+                )
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (company_name, job_role, application_date, status),
+                (company_name, job_role, application_date, status, interview_date),
             )
+
+
+def update_application_status(application_id, status):
+    """Update an application's status."""
+    with closing(sqlite3.connect(DATABASE_PATH)) as connection:
+        with connection:
+            connection.execute(
+                "UPDATE applications SET status = ? WHERE application_id = ?",
+                (status, application_id),
+            )
+
+
+def delete_application(application_id):
+    """Delete an application by its identifier."""
+    with closing(sqlite3.connect(DATABASE_PATH)) as connection:
+        with connection:
+            connection.execute(
+                "DELETE FROM applications WHERE application_id = ?",
+                (application_id,),
+            )
+
+
+def filter_applications(applications, company_search="", selected_status="All statuses"):
+    """Filter application rows by company name and status."""
+    search_term = company_search.strip().casefold()
+    return [
+        application
+        for application in applications
+        if search_term in application["company_name"].casefold()
+        and (
+            selected_status == "All statuses"
+            or (application["status"] or "Unspecified") == selected_status
+        )
+    ]
+
+
+def applications_to_csv(applications):
+    """Serialize application records as a CSV string."""
+    return pd.DataFrame([dict(application) for application in applications]).to_csv(
+        index=False
+    )
 
 
 def main():
@@ -78,11 +140,35 @@ def main():
     st.write("Keep your job applications organized and see your progress at a glance.")
 
     try:
+        initialize_database(DATABASE_PATH)
         applications, role_counts, status_rows = get_applications()
     except sqlite3.Error as error:
         st.error(f"Could not read the applications database: {error}")
         st.info("Check that placements.db is next to app.py and that it contains an applications table.")
         return
+
+    st.header("Upcoming interviews")
+    try:
+        upcoming_interviews = get_upcoming_interviews()
+    except sqlite3.Error as error:
+        st.error(f"Could not read upcoming interviews: {error}")
+        upcoming_interviews = None
+
+    if upcoming_interviews:
+        st.dataframe(
+            [dict(interview) for interview in upcoming_interviews],
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "application_id": st.column_config.NumberColumn("Application ID"),
+                "company_name": st.column_config.TextColumn("Company Name"),
+                "job_role": st.column_config.TextColumn("Job Role"),
+                "interview_date": st.column_config.DateColumn("Interview Date"),
+                "status": st.column_config.TextColumn("Status"),
+            },
+        )
+    elif upcoming_interviews is not None:
+        st.info("No upcoming interviews scheduled.")
 
     st.header("Add an application")
     with st.form("add_application_form", clear_on_submit=True):
@@ -90,6 +176,7 @@ def main():
         job_role = st.text_input("Job Role")
         application_date = st.date_input("Application Date", value=date.today())
         status = st.selectbox("Status", STATUS_OPTIONS)
+        interview_date = st.date_input("Interview Date (optional)", value=None)
         submitted = st.form_submit_button("Add Application", type="primary")
 
     if submitted:
@@ -105,6 +192,7 @@ def main():
                     job_role,
                     application_date.isoformat(),
                     status,
+                    interview_date.isoformat() if interview_date else None,
                 )
                 st.success("Application added successfully.")
                 st.rerun()
@@ -154,8 +242,22 @@ def main():
 
     st.header("All applications")
     if applications:
-        # Convert SQLite rows to dictionaries for a readable Streamlit table.
-        table_data = [dict(application) for application in applications]
+        search_column, status_column = st.columns(2)
+        company_search = search_column.text_input("Search by company name")
+        existing_statuses = {
+            row["status"] or "Unspecified" for row in status_rows
+        }
+        filter_options = ["All statuses"] + sorted(
+            existing_statuses.union(STATUS_OPTIONS)
+        )
+        selected_status = status_column.selectbox(
+            "Filter by status", filter_options
+        )
+
+        filtered_applications = filter_applications(
+            applications, company_search, selected_status
+        )
+        table_data = [dict(application) for application in filtered_applications]
         st.dataframe(
             table_data,
             width="stretch",
@@ -166,8 +268,69 @@ def main():
                 "job_role": st.column_config.TextColumn("Job Role"),
                 "application_date": st.column_config.TextColumn("Application Date"),
                 "status": st.column_config.TextColumn("Status"),
+                "interview_date": st.column_config.DateColumn("Interview Date"),
             },
         )
+
+        st.download_button(
+            "Download filtered applications as CSV",
+            data=applications_to_csv(filtered_applications),
+            file_name="placement_applications.csv",
+            mime="text/csv",
+        )
+
+        if filtered_applications:
+            st.subheader("Manage applications")
+            for application in filtered_applications:
+                application_id = application["application_id"]
+                label = (
+                    f"{application['company_name']} — {application['job_role']} "
+                    f"(ID {application_id})"
+                )
+                with st.expander(label):
+                    current_status = application["status"]
+                    status_options = list(STATUS_OPTIONS)
+                    if current_status and current_status not in status_options:
+                        status_options.append(current_status)
+                    selected_status_index = (
+                        status_options.index(current_status)
+                        if current_status in status_options
+                        else 0
+                    )
+                    new_status = st.selectbox(
+                        "Status",
+                        status_options,
+                        index=selected_status_index,
+                        key=f"status_{application_id}",
+                    )
+                    if st.button(
+                        "Update status",
+                        key=f"update_{application_id}",
+                    ):
+                        try:
+                            update_application_status(application_id, new_status)
+                            st.success("Application status updated.")
+                            st.rerun()
+                        except sqlite3.Error as error:
+                            st.error(f"Could not update the application status: {error}")
+
+                    confirmed = st.checkbox(
+                        "Confirm deletion",
+                        key=f"confirm_delete_{application_id}",
+                    )
+                    if st.button(
+                        "Delete application",
+                        key=f"delete_{application_id}",
+                        disabled=not confirmed,
+                    ):
+                        try:
+                            delete_application(application_id)
+                            st.success("Application deleted.")
+                            st.rerun()
+                        except sqlite3.Error as error:
+                            st.error(f"Could not delete the application: {error}")
+        else:
+            st.info("No applications match the selected search and status filters.")
     else:
         st.info("No applications yet. Add one using the form above.")
 

@@ -1,30 +1,38 @@
+from contextlib import closing
+from pathlib import Path
 import sqlite3
 
 
-# Connect to the SQLite database file (SQLite creates it if it does not exist).
-connection = sqlite3.connect("placements.db")
+DATABASE_PATH = Path(__file__).with_name("placements.db")
 
-try:
-    # Create a cursor so we can run an SQL command.
-    cursor = connection.cursor()
 
-    # Create the applications table if it has not been created yet.
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS applications (
-            application_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            company_name TEXT NOT NULL,
-            job_role TEXT NOT NULL,
-            application_date TEXT,
-            status TEXT
-        )
-        """
-    )
+def initialize_database(database_path=DATABASE_PATH):
+    """Create the applications table and migrate older databases in place."""
+    with closing(sqlite3.connect(database_path)) as connection:
+        with connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS applications (
+                    application_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    company_name TEXT NOT NULL,
+                    job_role TEXT NOT NULL,
+                    application_date TEXT,
+                    status TEXT,
+                    interview_date TEXT
+                )
+                """
+            )
 
-    # Save the table creation in the database.
-    connection.commit()
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(applications)")
+            }
+            if "interview_date" not in columns:
+                connection.execute(
+                    "ALTER TABLE applications ADD COLUMN interview_date TEXT"
+                )
 
+
+if __name__ == "__main__":
+    initialize_database()
     print("Database and applications table created successfully.")
-finally:
-    # Always close the connection when we are finished.
-    connection.close()
